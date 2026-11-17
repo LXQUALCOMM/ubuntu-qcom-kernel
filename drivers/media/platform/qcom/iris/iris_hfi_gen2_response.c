@@ -542,9 +542,33 @@ static void iris_hfi_gen2_read_input_subcr_params(struct iris_inst *inst)
 	pixmp_ip->width = width;
 	pixmp_ip->height = height;
 
-	pixmp_op->width = ALIGN(width, 128);
-	pixmp_op->height = ALIGN(height, 32);
-	pixmp_op->plane_fmt[0].bytesperline = ALIGN(width, 128);
+	if (subsc_params.bit_depth == BIT_DEPTH_8 &&
+	    pixmp_op->pixelformat != V4L2_PIX_FMT_NV12 &&
+	    pixmp_op->pixelformat != V4L2_PIX_FMT_QC08C)
+		pixmp_op->pixelformat = V4L2_PIX_FMT_NV12;
+	else if (subsc_params.bit_depth == BIT_DEPTH_10 &&
+		 pixmp_op->pixelformat != V4L2_PIX_FMT_P010 &&
+		 pixmp_op->pixelformat != V4L2_PIX_FMT_QC10C)
+		pixmp_op->pixelformat = V4L2_PIX_FMT_P010;
+
+	switch (pixmp_op->pixelformat) {
+	case V4L2_PIX_FMT_P010:
+		pixmp_op->width = ALIGN(width, 128);
+		pixmp_op->height = ALIGN(height, 32);
+		pixmp_op->plane_fmt[0].bytesperline = ALIGN(width * 2, 256);
+		break;
+	case V4L2_PIX_FMT_QC10C:
+		pixmp_op->width = roundup(width, 192);
+		pixmp_op->height = ALIGN(height, 16);
+		pixmp_op->plane_fmt[0].bytesperline = ALIGN(pixmp_op->width * 4 / 3, 256);
+		break;
+	case V4L2_PIX_FMT_NV12:
+	case V4L2_PIX_FMT_QC08C:
+		pixmp_op->width = ALIGN(width, 128);
+		pixmp_op->height = ALIGN(height, 32);
+		pixmp_op->plane_fmt[0].bytesperline = pixmp_op->width;
+		break;
+	}
 	pixmp_op->plane_fmt[0].sizeimage = iris_get_buffer_size(inst, BUF_OUTPUT);
 
 	matrix_coeff = subsc_params.color_info & 0xFF;
@@ -610,7 +634,12 @@ static void iris_hfi_gen2_read_input_subcr_params(struct iris_inst *inst)
 	inst->fw_caps[POC].value = subsc_params.pic_order_cnt;
 	inst->fw_caps[TIER].value = subsc_params.tier;
 
-	if (subsc_params.bit_depth != BIT_DEPTH_8 ||
+	if (subsc_params.bit_depth == BIT_DEPTH_8)
+		inst->fw_caps[BIT_DEPTH].value = BIT_DEPTH_8;
+	else
+		inst->fw_caps[BIT_DEPTH].value = BIT_DEPTH_10;
+
+	if ((subsc_params.bit_depth != BIT_DEPTH_8 && subsc_params.bit_depth != BIT_DEPTH_10) ||
 	    !(subsc_params.coded_frames & HFI_BITMASK_FRAME_MBS_ONLY_FLAG)) {
 		dev_err(core->dev, "unsupported content, bit depth: %x, pic_struct = %x\n",
 			subsc_params.bit_depth, subsc_params.coded_frames);
@@ -957,19 +986,21 @@ static int iris_hfi_gen2_handle_response(struct iris_core *core, void *response)
 		return iris_hfi_gen2_handle_session_response(core, hdr);
 }
 
-static void iris_hfi_gen2_flush_debug_queue(struct iris_core *core, u8 *packet)
+static int iris_hfi_gen2_flush_debug_queue(struct iris_core *core, u8 *packet)
 {
 	struct hfi_debug_header *pkt;
+	int num_pkts = 0;
 	u32 log_size;
 	u8 *log;
 
 	while (!iris_hfi_queue_dbg_read(core, packet)) {
 		pkt = (struct hfi_debug_header *)packet;
+		num_pkts++;
 
 		if (pkt->size <= sizeof(*pkt) + 1)
 			continue;
 
-		if (pkt->size >= IFACEQ_CORE_PKT_SIZE)
+		if (pkt->size > IFACEQ_CORE_PKT_SIZE)
 			continue;
 
 		log = (u8 *)packet + sizeof(*pkt) + 1;
@@ -979,10 +1010,15 @@ static void iris_hfi_gen2_flush_debug_queue(struct iris_core *core, u8 *packet)
 		else
 			dev_dbg(core->dev, "%.*s", (int)log_size, log);
 	}
+
+	return num_pkts;
 }
 
 void iris_hfi_gen2_response_handler(struct iris_core *core)
 {
+	int num_debug_pkts;
+	int num_msg_pkts;
+
 	if (iris_vpu_watchdog(core, core->intr_status)) {
 		struct iris_hfi_packet pkt = {.type = HFI_SYS_ERROR_WD_TIMEOUT};
 
@@ -993,11 +1029,16 @@ void iris_hfi_gen2_response_handler(struct iris_core *core)
 		return;
 	}
 
-	memset(core->response_packet, 0, sizeof(struct iris_hfi_header));
-	while (!iris_hfi_queue_msg_read(core, core->response_packet)) {
-		iris_hfi_gen2_handle_response(core, core->response_packet);
+	do {
+		num_msg_pkts = 0;
 		memset(core->response_packet, 0, sizeof(struct iris_hfi_header));
-	}
+		while (!iris_hfi_queue_msg_read(core, core->response_packet)) {
+			iris_hfi_gen2_handle_response(core, core->response_packet);
+			num_msg_pkts++;
+			memset(core->response_packet, 0, sizeof(struct iris_hfi_header));
+		}
 
-	iris_hfi_gen2_flush_debug_queue(core, core->response_packet);
+		num_debug_pkts =
+			iris_hfi_gen2_flush_debug_queue(core, core->response_packet);
+	} while (num_msg_pkts || num_debug_pkts);
 }
